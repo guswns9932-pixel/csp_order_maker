@@ -268,14 +268,12 @@ def ship_to_suffix(code):
     return code.rsplit("-", 1)[-1].strip()
 
 
-RED_FONT = Font(color="FFFF0000")
-
-
 # ---------------------------------------------------------------- 엑셀 출력
-def build_output(template_path, rows, out_path, cip_fsc=None):
+def build_output(template_path, rows, out_path):
     """rows : [{열키: 값}] 을 받아 Sheet1 양식의 새 파일을 만든다.
-    cip_fsc 가 주어지면, 자재코드(Q)가 그 집합에 완전히 일치할 때
-    해당 셀 글자를 빨간색으로 표시한다 (CIP 시트 AS-IS FSC 경고)."""
+    CIP 경고(빨간 글씨)는 화면 입력 단계에서만 표시하고, 업로드에 쓰이는
+    실제 파일에는 서식을 남기지 않는다 (일부 업로드 매크로가 글자색을
+    '이 값은 쓰지 말 것'으로 해석해 정상 자재코드를 거부하는 문제가 있었음)."""
     tpl = load_workbook(template_path)
     tws = tpl["Sheet1"]
 
@@ -308,8 +306,6 @@ def build_output(template_path, rows, out_path, cip_fsc=None):
             cell = ws.cell(row=r, column=idx, value=data.get(key))
             if key in ("G", "J", "T"):     # 텍스트 형식 (업로드 시스템이 날짜형 셀을
                 cell.number_format = "@"   # 그대로 인식하지 못하므로 문자열로 고정)
-            if key == "Q" and cip_fsc and str(data.get(key) or "") in cip_fsc:
-                cell.font = RED_FONT
 
     wb.save(out_path)
     return out_path
@@ -1068,7 +1064,7 @@ class App(tk.Tk):
             return
         rows = self._build_rows(common)
         try:
-            build_output(self.master_path.get(), rows, out, cip_fsc=self.md.cip_fsc)
+            build_output(self.master_path.get(), rows, out)
             append_log(log_path(), rows, os.path.basename(out))
         except Exception as e:
             messagebox.showerror("오류", "파일 생성에 실패했습니다.\n\n%s" % e)
