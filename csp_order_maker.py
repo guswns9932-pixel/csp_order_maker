@@ -28,6 +28,7 @@ APP_TITLE = "CSP 주문접수 업로드 파일 생성기  (alpha v0.1)"
 TEMPLATE_NAME = "CSP_주문접수_업로드_통합양식.xlsx"
 SETTINGS_NAME = "csp_order_maker_settings.json"
 LOG_NAME = "CSP_주문접수_전체로그.xlsx"
+UPLOAD_DIR_NAME = "CSP 주문접수 UPLOAD"
 
 # ---------------------------------------------------------------- 양식 정의
 # (엑셀열, 헤더명, 필수여부)
@@ -74,6 +75,14 @@ def app_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def upload_dir():
+    """생성된 주문접수 파일과 로그를 모아두는 폴더 (실행파일 위치 기준),
+    없으면 새로 만든다."""
+    path = os.path.join(app_dir(), UPLOAD_DIR_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 # ---------------------------------------------------------------- 마스터 데이터
@@ -468,7 +477,7 @@ def _use_shared_strings(path):
 
 # ---------------------------------------------------------------- 전체 로그
 def log_path():
-    return os.path.join(app_dir(), LOG_NAME)
+    return os.path.join(upload_dir(), LOG_NAME)
 
 
 def append_log(path, rows, source_name):
@@ -1343,12 +1352,13 @@ class App(tk.Tk):
             messagebox.showwarning("확인 필요", "\n".join(errs[:15]))
             return
 
-        default = "CSP_주문접수_%s.xlsx" % dt.datetime.now().strftime("%Y%m%d_%H%M")
-        out = filedialog.asksaveasfilename(
-            title="저장 위치", defaultextension=".xlsx",
-            initialfile=default, filetypes=[("Excel", "*.xlsx")])
-        if not out:
-            return
+        out_dir = upload_dir()
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(out_dir, "CSP_주문접수_%s.xlsx" % stamp)
+        n = 1
+        while os.path.exists(out):        # 같은 초에 두 번 생성되는 경우 대비
+            n += 1
+            out = os.path.join(out_dir, "CSP_주문접수_%s_%d.xlsx" % (stamp, n))
         rows = self._build_rows(common)
         try:
             build_output(self.master_path.get(), rows, out)
