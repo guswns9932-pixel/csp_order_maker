@@ -88,6 +88,7 @@ class MasterData:
         self.currencies = []
         self.comm_types = []
         self.fsc = []              # [(FSC, VER, FSC NM, 설명, 상태)]
+        self.fsc_filter_note = ""  # 필터가 완화/생략된 경우의 안내 문구
         self._load()
 
     @staticmethod
@@ -137,23 +138,47 @@ class MasterData:
             if "FSC" in wb.sheetnames:
                 ws = wb["FSC"]
                 seen = set()
+                candidates = []
                 for row in ws.iter_rows(min_row=2, max_col=11, values_only=True):
                     code = self._s(row[1])          # B열 : FSC
                     if not code or code in seen:
                         continue
-                    status = self._s(row[10])       # K열 : 상태
-                    if code.upper().startswith("D"):
-                        continue                    # D로 시작하는 FSC는 검색 대상 제외
-                    if status != "BOM활성화":
-                        continue                    # 상태가 'BOM활성화'인 것만 검색 대상
                     seen.add(code)
-                    self.fsc.append((
+                    candidates.append((
                         code,
                         self._s(row[2]),            # C열 : VER
                         self._s(row[5]),            # F열 : FSC NM
                         self._s(row[7]).replace("\n", " "),   # H열 : 설명
-                        status,
+                        self._s(row[10]),           # K열 : 상태
                     ))
+
+                def is_bom_active(status):
+                    # 공백/대소문자 차이를 흡수해서 'BOM활성화', 'BOM 활성화' 등을
+                    # 모두 활성으로 인식한다.
+                    norm = re.sub(r"\s+", "", status).upper()
+                    return norm == "BOM활성화".upper()
+
+                not_d = [f for f in candidates if not f[0].upper().startswith("D")]
+                both = [f for f in not_d if is_bom_active(f[4])]
+
+                # 필터를 다 적용했을 때 결과가 하나도 없으면, 실제 파일의 '상태'
+                # 표기가 예상('BOM활성화')과 달라서 전부 걸러졌을 가능성이 높다.
+                # 검색창이 완전히 비어버리는 것을 막기 위해 단계적으로 필터를
+                # 완화해서라도 목록을 보여준다.
+                if both:
+                    self.fsc, self.fsc_filter_note = both, ""
+                elif not_d:
+                    self.fsc = not_d
+                    self.fsc_filter_note = (
+                        "FSC 상태값이 'BOM활성화'와 일치하는 항목이 없어 "
+                        "상태 필터 없이 %d건을 표시합니다." % len(not_d))
+                elif candidates:
+                    self.fsc = candidates
+                    self.fsc_filter_note = (
+                        "필터 조건과 일치하는 FSC가 없어 전체 %d건을 표시합니다."
+                        % len(candidates))
+                else:
+                    self.fsc, self.fsc_filter_note = [], ""
         finally:
             wb.close()
 
@@ -431,16 +456,21 @@ class App(tk.Tk):
             if not initial:
                 messagebox.showerror("오류", "양식 파일을 찾을 수 없습니다.")
             self.status.config(text="양식 파일을 지정해 주세요.")
+            self._set_form_locked(self.md is None)
             return
         try:
             self.md = MasterData(path)
         except Exception as e:
             messagebox.showerror("오류", "양식 파일을 읽지 못했습니다.\n\n%s" % e)
+            self._set_form_locked(self.md is None)
             return
         self._fill_combos()
-        self.status.config(
-            text="양식 로드 완료 · 판매처 %d · 인도처 %d · FSC %d건"
-                 % (len(self.md.sold_to), len(self.md.ship_to), len(self.md.fsc)))
+        text = ("양식 로드 완료 · 판매처 %d · 인도처 %d · FSC %d건"
+                % (len(self.md.sold_to), len(self.md.ship_to), len(self.md.fsc)))
+        if self.md.fsc_filter_note:
+            text += " (%s)" % self.md.fsc_filter_note
+        self.status.config(text=text)
+        self._set_form_locked(self.md is None)
 
     def _fill_combos(self):
         def items(pairs):
@@ -457,6 +487,34 @@ class App(tk.Tk):
             values = self.cbo[key]["values"]
             if values and not self.common_vars[key].get().strip():
                 self.common_vars[key].set(values[0])
+
+    def _on_locked_click(self, event):
+        """양식을 불러오기 전에 입력 영역을 클릭하면 안내 문구를 띄운다."""
+        if self.md is not None:
+            return
+        w = event.widget
+        while w is not None:
+            if w in (getattr(self, "_common_box", None), getattr(self, "_line_box", None)):
+                messagebox.showinfo("안내", "먼저 통합양식을 업로드 하세요.")
+                return
+            w = w.master
+
+    def _set_state_recursive(self, widget, disabled):
+        flag = "disabled" if disabled else "!disabled"
+        for child in widget.winfo_children():
+            if isinstance(child, (ttk.Entry, ttk.Combobox, ttk.Button, ttk.Treeview)):
+                try:
+                    child.state([flag])
+                except tk.TclError:
+                    pass
+            self._set_state_recursive(child, disabled)
+
+    def _set_form_locked(self, locked):
+        """양식을 불러오기 전에는 공통값/품목 라인 입력 영역을 모두 비활성화한다."""
+        if hasattr(self, "_common_box"):
+            self._set_state_recursive(self._common_box, locked)
+        if hasattr(self, "_line_box"):
+            self._set_state_recursive(self._line_box, locked)
 
     # ---------- 화면 구성
     def _build_ui(self):
@@ -477,12 +535,14 @@ class App(tk.Tk):
         box = ttk.LabelFrame(root, text=" 공통값 (모든 행에 동일하게 들어감) ",
                              padding=8)
         box.pack(fill="x")
+        self._common_box = box
         self.cbo = {}
         self._common_grid(box)
 
         # 품목 라인 입력
         lbox = ttk.LabelFrame(root, text=" 품목 라인 (행마다 달라지는 값) ", padding=8)
         lbox.pack(fill="both", expand=True, pady=(8, 0))
+        self._line_box = lbox
         self._line_form(lbox)
         self._line_table(lbox)
 
@@ -495,6 +555,9 @@ class App(tk.Tk):
                    command=self._export).pack(side="right")
         ttk.Button(bottom, text="공통값 저장",
                    command=self._save_settings).pack(side="right", padx=6)
+
+        # 양식을 아직 불러오기 전에는 입력칸을 잠그고, 클릭하면 안내 문구를 띄운다.
+        self.bind_all("<Button-1>", self._on_locked_click, add="+")
 
     def _common_grid(self, parent):
         """공통값 입력칸을 4열로 배치."""
