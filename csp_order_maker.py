@@ -262,6 +262,23 @@ def cursor_after_mask(fixed, digit_count):
     return i
 
 
+def due_date_color(d, today=None):
+    """납품요청일까지 남은 기간에 따른 경고색을 정한다 (작성일 기준).
+    6주 이내: 빨강, 6~7주: 주황, 8주 이상: 파랑. (7~8주 사이는 특별히
+    급하지도 여유롭지도 않은 구간이라 색을 넣지 않는다)"""
+    if d is None:
+        return None
+    today = today or dt.date.today()
+    days = (d - today).days
+    if days <= 6 * 7:
+        return "red"
+    if days <= 7 * 7:
+        return "orange"
+    if days >= 8 * 7:
+        return "blue"
+    return None
+
+
 def ship_to_suffix(code):
     """인도처코드의 '-' 뒤 단어를 뽑아낸다. 예: '삼성전자-16L' -> '16L'"""
     code = str(code).strip()
@@ -277,6 +294,7 @@ REQUEST_COLS = {
     "material": "F",    # Material (참고용, 자동입력 없음)
     "desc": "G",        # Material Description -> 'LOT,' 뒤 값으로 자재코드 검색
     "qty": "H",         # 수량 -> 생성수량
+    "line": "K",        # 라인 -> '_' 뒤 값으로 대공정
     "subprocess": "N",  # 세부공정 -> 고객세부공정
     "maker": "X",       # 설비Maker -> 설비MAKER
     "equip_no": "Z",    # 설비호기 -> 고객설비호기
@@ -293,6 +311,14 @@ def extract_after_lot(text):
     if idx == -1:
         return ""
     return text[idx + len(marker):].strip()
+
+
+def extract_after_underscore(text):
+    """'P1F_CVD' -> 'CVD' ('_' 뒤 값을 뽑아낸다. 없으면 원문 그대로)"""
+    text = str(text or "").strip()
+    if "_" not in text:
+        return text
+    return text.rsplit("_", 1)[-1].strip()
 
 
 def load_request_rows(path):
@@ -776,11 +802,13 @@ class App(tk.Tk):
         self.request_status = ttk.Label(bar, text="", foreground="#555")
         self.request_status.pack(side="left", padx=(10, 0))
 
-        cols = ["po", "material", "desc", "qty", "subprocess", "maker", "equip_no", "due"]
+        cols = ["po", "material", "desc", "qty", "line", "subprocess", "maker",
+                "equip_no", "due"]
         headers = {"po": "고객PO번호(D)", "material": "Material(F)", "desc": "규격(G)",
-                  "qty": "수량(H)", "subprocess": "세부공정(N)", "maker": "설비Maker(X)",
-                  "equip_no": "설비호기(Z)", "due": "희망납품일(AA)"}
-        widths = {"po": 110, "material": 100, "desc": 220, "qty": 50,
+                  "qty": "수량(H)", "line": "라인(K)", "subprocess": "세부공정(N)",
+                  "maker": "설비Maker(X)", "equip_no": "설비호기(Z)",
+                  "due": "희망납품일(AA)"}
+        widths = {"po": 110, "material": 100, "desc": 220, "qty": 50, "line": 90,
                  "subprocess": 110, "maker": 90, "equip_no": 90, "due": 90}
         wrap = ttk.Frame(parent)
         wrap.pack(fill="x", pady=(6, 0))
@@ -826,6 +854,7 @@ class App(tk.Tk):
                 r.get("material") if r.get("material") is not None else "",
                 r.get("desc") if r.get("desc") is not None else "",
                 r.get("qty") if r.get("qty") is not None else "",
+                r.get("line") if r.get("line") is not None else "",
                 r.get("subprocess") if r.get("subprocess") is not None else "",
                 r.get("maker") if r.get("maker") is not None else "",
                 r.get("equip_no") if r.get("equip_no") is not None else "",
@@ -849,6 +878,8 @@ class App(tk.Tk):
         qty = parse_int(r.get("qty"))
         self.line_qty.set(str(qty) if qty and qty >= 1 else "1")
 
+        if r.get("line") is not None:
+            self.line_vars["M"].set(extract_after_underscore(r["line"]))
         if r.get("subprocess") is not None:
             self.line_vars["O"].set(str(r["subprocess"]).strip())
         if r.get("maker") is not None:
@@ -924,6 +955,9 @@ class App(tk.Tk):
         # 납품요청일 입력 형식을 yyyy-mm-dd 로 고정
         self._t_guard = False
         self.line_vars["T"].trace_add("write", lambda *_: self._on_date_input())
+        # 납품요청일까지 남은 기간에 따라 입력칸 글자색을 바꾼다 (6주내 빨강/
+        # 7주내 주황/8주이상 파랑)
+        self.line_vars["T"].trace_add("write", lambda *_: self._update_due_color())
 
         btns = ttk.Frame(parent)
         btns.pack(fill="x", pady=(6, 6))
@@ -957,6 +991,9 @@ class App(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="left", fill="y")
         self.tree.tag_configure("cip_warn", foreground="red")
+        self.tree.tag_configure("due_red", foreground="red")
+        self.tree.tag_configure("due_orange", foreground="orange")
+        self.tree.tag_configure("due_blue", foreground="blue")
         self.tree.bind("<Double-1>", lambda e: self._load_selected())
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<<TreeviewSelect>>", self._refresh_checks)
@@ -1091,6 +1128,13 @@ class App(tk.Tk):
         else:
             self._t_guard = False
 
+    def _update_due_color(self):
+        d = parse_date(self.line_vars["T"].get())
+        color = due_date_color(d) or "black"
+        entry = getattr(self, "entry_T", None)
+        if entry is not None:
+            entry.configure(foreground=color)
+
     def _clear_line_form(self):
         for k in LINE_KEYS:
             self.line_vars[k].set("")
@@ -1221,7 +1265,14 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         cip = self.md.cip_fsc if self.md else set()
         for n, d in enumerate(self.lines, start=1):
-            tags = ("cip_warn",) if d["Q"].strip() in cip else ()
+            # 자재코드 경고(cip_warn)와 납품요청일 임박색은 ttk.Treeview가
+            # 행 하나에 글자색을 하나만 줄 수 있어 동시에 표시하지 못한다.
+            # 자재코드 문제가 더 치명적이므로 그쪽을 우선한다.
+            if d["Q"].strip() in cip:
+                tags = ("cip_warn",)
+            else:
+                color = due_date_color(parse_date(d["T"]))
+                tags = ("due_%s" % color,) if color else ()
             self.tree.insert("", "end", values=["☐", n] + [d[k] for k in LINE_KEYS],
                              tags=tags)
         self.line_count.config(text="%d 행" % len(self.lines))
