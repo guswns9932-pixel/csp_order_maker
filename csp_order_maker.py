@@ -14,7 +14,9 @@ import os
 import re
 import sys
 import json
+import zipfile
 import datetime as dt
+import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -351,7 +353,91 @@ def build_output(template_path, rows, out_path):
                 cell.number_format = "@"   # 그대로 인식하지 못하므로 문자열로 고정)
 
     wb.save(out_path)
+    _use_shared_strings(out_path)
     return out_path
+
+
+_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_NS_CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+_NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_NS_XML = "http://www.w3.org/XML/1998/namespace"
+
+
+def _use_shared_strings(path):
+    """openpyxl은 문자열 셀을 항상 인라인 문자열(t="inlineStr")로 저장하는데,
+    일부 업로드 프로그램은 이 형식을 인식하지 못하고 엑셀의 표준 공유 문자열
+    표(sharedStrings.xml, t="s") 형식만 읽어들인다. 그래서 우리가 만든 파일을
+    열었다가 그냥 저장만 해도(엑셀이 공유 문자열로 다시 써주므로) 자재코드가
+    갑자기 인식되는 현상이 있었다. 매번 손으로 다시 저장하지 않아도 되도록
+    엑셀과 동일한 형식으로 파일을 즉석에서 다시 써준다."""
+    ET.register_namespace("", _NS_MAIN)
+
+    with zipfile.ZipFile(path, "r") as zin:
+        data = {name: zin.read(name) for name in zin.namelist()}
+
+    sheet_path = "xl/worksheets/sheet1.xml"
+    root = ET.fromstring(data[sheet_path])
+
+    strings, index = [], {}
+
+    def sst_index(text):
+        if text not in index:
+            index[text] = len(strings)
+            strings.append(text)
+        return index[text]
+
+    is_tag, t_tag, v_tag = (f"{{{_NS_MAIN}}}{n}" for n in ("is", "t", "v"))
+    for c in root.iter(f"{{{_NS_MAIN}}}c"):
+        if c.get("t") != "inlineStr":
+            continue
+        is_el = c.find(is_tag)
+        if is_el is None:
+            continue
+        t_el = is_el.find(t_tag)
+        text = t_el.text if t_el is not None and t_el.text is not None else ""
+        c.remove(is_el)
+        c.set("t", "s")
+        ET.SubElement(c, v_tag).text = str(sst_index(text))
+
+    data[sheet_path] = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+    sst_root = ET.Element(f"{{{_NS_MAIN}}}sst", {
+        "count": str(len(strings)), "uniqueCount": str(len(strings))})
+    for s in strings:
+        si = ET.SubElement(sst_root, f"{{{_NS_MAIN}}}si")
+        t_el = ET.SubElement(si, f"{{{_NS_MAIN}}}t")
+        t_el.text = s
+        if s != s.strip():
+            t_el.set(f"{{{_NS_XML}}}space", "preserve")
+    data["xl/sharedStrings.xml"] = ET.tostring(
+        sst_root, encoding="UTF-8", xml_declaration=True)
+
+    ct_path = "[Content_Types].xml"
+    ct_root = ET.fromstring(data[ct_path])
+    if not any(el.get("PartName") == "/xl/sharedStrings.xml" for el in ct_root):
+        ET.SubElement(ct_root, f"{{{_NS_CT}}}Override", {
+            "PartName": "/xl/sharedStrings.xml",
+            "ContentType": "application/vnd.openxmlformats-officedocument."
+                           "spreadsheetml.sharedStrings+xml"})
+    data[ct_path] = ET.tostring(ct_root, encoding="UTF-8", xml_declaration=True)
+
+    rels_path = "xl/_rels/workbook.xml.rels"
+    rels_root = ET.fromstring(data[rels_path])
+    if not any(el.get("Target") == "sharedStrings.xml" for el in rels_root):
+        existing = {el.get("Id") for el in rels_root}
+        n = 1
+        while "rId%d" % n in existing:
+            n += 1
+        ET.SubElement(rels_root, f"{{{_NS_REL}}}Relationship", {
+            "Id": "rId%d" % n,
+            "Type": "http://schemas.openxmlformats.org/officeDocument/2006/"
+                    "relationships/sharedStrings",
+            "Target": "sharedStrings.xml"})
+    data[rels_path] = ET.tostring(rels_root, encoding="UTF-8", xml_declaration=True)
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, content in data.items():
+            zout.writestr(name, content)
 
 
 # ---------------------------------------------------------------- 전체 로그
