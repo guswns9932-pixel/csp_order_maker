@@ -15,6 +15,7 @@ import re
 import sys
 import json
 import zipfile
+import subprocess
 import datetime as dt
 import xml.etree.ElementTree as ET
 import tkinter as tk
@@ -83,6 +84,19 @@ def upload_dir():
     path = os.path.join(app_dir(), UPLOAD_DIR_NAME)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def open_folder(path):
+    """탐색기(또는 각 OS의 파일관리자)로 폴더를 연다."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- 마스터 데이터
@@ -273,19 +287,16 @@ def cursor_after_mask(fixed, digit_count):
 
 def due_date_color(d, today=None):
     """납품요청일까지 남은 기간에 따른 경고색을 정한다 (작성일 기준).
-    6주 이내: 빨강, 6~7주: 주황, 8주 이상: 파랑. (7~8주 사이는 특별히
-    급하지도 여유롭지도 않은 구간이라 색을 넣지 않는다)"""
+    6주 이내: 빨강, 6~8주: 주황, 8주 이상: 파랑."""
     if d is None:
         return None
     today = today or dt.date.today()
     days = (d - today).days
     if days <= 6 * 7:
         return "red"
-    if days <= 7 * 7:
+    if days < 8 * 7:
         return "orange"
-    if days >= 8 * 7:
-        return "blue"
-    return None
+    return "blue"
 
 
 def ship_to_suffix(code):
@@ -502,28 +513,62 @@ def append_log(path, rows, source_name):
     wb.save(path)
 
 
-def load_price_map(path):
-    """로그 파일을 읽어 자재코드 -> 가장 최근 단가 매핑을 만든다."""
+def safe_append_log(rows, source_name):
+    """로그 파일에 기록하되, 다른 프로그램(엑셀 등)이 파일을 열어두는 등의
+    이유로 쓰기가 충돌하면 실패하는 대신 번호를 붙인 새 로그 파일을 만들어
+    기록을 남긴다. 잠금이 풀리면 다음 번에는 다시 원래 로그 파일에 쌓인다."""
+    base, ext = os.path.splitext(LOG_NAME)
+    path = log_path()
+    last_err = None
+    for n in range(1, 51):
+        try:
+            append_log(path, rows, source_name)
+            return path
+        except Exception as e:
+            last_err = e
+            path = os.path.join(upload_dir(), "%s_%d%s" % (base, n + 1, ext))
+    raise last_err
+
+
+def _log_file_candidates():
+    """upload_dir 안의 로그 파일들을 모두 찾는다 (쓰기 충돌로 번호가 붙어
+    따로 생성된 파일들 포함)."""
+    base, ext = os.path.splitext(LOG_NAME)
+    folder = upload_dir()
+    pattern = re.compile(r"^%s(_\d+)?%s$" % (re.escape(base), re.escape(ext)))
+    return [os.path.join(folder, name) for name in os.listdir(folder)
+            if pattern.match(name)]
+
+
+def load_price_map(path=None):
+    """로그 파일(쓰기 충돌로 나뉜 것 포함)을 모두 읽어 자재코드 -> 가장
+    최근 단가 매핑을 만든다. path 를 지정하면 그 파일 하나만 읽는다."""
+    paths = [path] if path is not None else _log_file_candidates()
+    entries = []   # (생성일시, 자재코드, 단가) - 시간순 정렬 후 뒤에서 덮어써서 최신값을 남김
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        try:
+            wb = load_workbook(p, read_only=True, data_only=True)
+        except Exception:
+            continue
+        try:
+            ws = wb.active
+            q_idx = 2 + COL_INDEX["Q"]
+            w_idx = 2 + COL_INDEX["W"]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if len(row) <= max(q_idx, w_idx):
+                    continue
+                code, price = row[q_idx], row[w_idx]
+                if code is None or price is None:
+                    continue
+                entries.append((str(row[0] or ""), str(code).strip(), price))
+        finally:
+            wb.close()
+    entries.sort(key=lambda t: t[0])
     prices = {}
-    if not os.path.exists(path):
-        return prices
-    try:
-        wb = load_workbook(path, read_only=True, data_only=True)
-    except Exception:
-        return prices
-    try:
-        ws = wb.active
-        q_idx = 2 + COL_INDEX["Q"]
-        w_idx = 2 + COL_INDEX["W"]
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if len(row) <= max(q_idx, w_idx):
-                continue
-            code, price = row[q_idx], row[w_idx]
-            if code is None or price is None:
-                continue
-            prices[str(code).strip()] = price   # 아래로 갈수록 최신값이라 덮어쓰면 됨
-    finally:
-        wb.close()
+    for _, code, price in entries:
+        prices[code] = price
     return prices
 
 
@@ -621,7 +666,7 @@ class App(tk.Tk):
         self.common_vars = {}
         self.line_vars = {}
         self.lines = []          # [{열키: 원시 문자열}]
-        self.price_map = load_price_map(log_path())   # 자재코드 -> 최근 단가
+        self.price_map = load_price_map()   # 자재코드 -> 최근 단가 (모든 로그 파일 취합)
         self.request_path = tk.StringVar()
         self.request_rows = []    # 의뢰파일에서 읽은 dict 리스트
 
@@ -746,6 +791,8 @@ class App(tk.Tk):
         self.status.pack(side="left")
         ttk.Button(bottom, text="엑셀 파일 생성",
                    command=self._export).pack(side="right")
+        ttk.Button(bottom, text="생성 폴더 열기",
+                   command=self._open_upload_dir).pack(side="right", padx=(0, 6))
 
         # 양식을 아직 불러오기 전에는 입력칸을 잠그고, 클릭하면 안내 문구를 띄운다.
         self.bind_all("<Button-1>", self._on_locked_click, add="+")
@@ -1259,6 +1306,8 @@ class App(tk.Tk):
         idxs = self._selected_indices()
         if not idxs:
             return
+        if not messagebox.askyesno("확인", "선택한 %d개 행을 삭제할까요?" % len(idxs)):
+            return
         for i in sorted(idxs, reverse=True):
             del self.lines[i]
         self._clear_line_form()
@@ -1337,6 +1386,9 @@ class App(tk.Tk):
             rows.append(row)
         return rows
 
+    def _open_upload_dir(self):
+        open_folder(upload_dir())
+
     def _export(self):
         if not self.md:
             messagebox.showerror("오류", "먼저 양식 파일을 읽어주세요.")
@@ -1362,10 +1414,15 @@ class App(tk.Tk):
         rows = self._build_rows(common)
         try:
             build_output(self.master_path.get(), rows, out)
-            append_log(log_path(), rows, os.path.basename(out))
         except Exception as e:
             messagebox.showerror("오류", "파일 생성에 실패했습니다.\n\n%s" % e)
             return
+        try:
+            safe_append_log(rows, os.path.basename(out))
+        except Exception as e:
+            # 주문 파일 자체는 이미 만들어졌으니 실패로 처리하지 않고 알리기만 한다.
+            messagebox.showwarning(
+                "안내", "주문 파일은 생성되었지만 로그 기록에는 실패했습니다.\n\n%s" % e)
         for row in rows:                   # 다음 입력을 위해 최근 단가를 갱신
             q, w = row.get("Q"), row.get("W")
             if q and w is not None:
