@@ -20,7 +20,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Border, Alignment
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, column_index_from_string
 
 APP_TITLE = "CSP 주문접수 업로드 파일 생성기  (alpha v0.1)"
 TEMPLATE_NAME = "CSP_주문접수_업로드_통합양식.xlsx"
@@ -268,6 +268,49 @@ def ship_to_suffix(code):
     return code.rsplit("-", 1)[-1].strip()
 
 
+# ---------------------------------------------------------------- 의뢰파일
+# 의뢰파일(견적/발주 의뢰 엑셀)에서 가져올 열 (사용자가 지정한 열 문자 기준)
+REQUEST_COLS = {
+    "po": "D",          # Purchase Requisition -> 고객PO번호
+    "material": "F",    # Material (참고용, 자동입력 없음)
+    "desc": "G",        # Material Description -> 'LOT,' 뒤 값으로 자재코드 검색
+    "qty": "H",         # 수량 -> 생성수량
+    "subprocess": "N",  # 세부공정 -> 고객세부공정
+    "maker": "X",       # 설비Maker -> 설비MAKER
+    "equip_no": "Z",    # 설비호기 -> 고객설비호기
+    "due": "AA",        # 희망 납품일 -> 납품요청일
+}
+REQUEST_COL_IDX = {k: column_index_from_string(v) - 1 for k, v in REQUEST_COLS.items()}
+
+
+def extract_after_lot(text):
+    """'DRY_PUMP;EQ,LOT,HD4500PW' -> 'HD4500PW' (LOT, 뒤 값을 뽑아낸다)"""
+    text = str(text or "")
+    marker = "LOT,"
+    idx = text.find(marker)
+    if idx == -1:
+        return ""
+    return text[idx + len(marker):].strip()
+
+
+def load_request_rows(path):
+    """의뢰파일에서 D/F/G/H/N/X/Z/AA 열 값을 읽어 dict 리스트로 반환한다."""
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb.worksheets[0]
+        max_idx = max(REQUEST_COL_IDX.values())
+        rows = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row is None or len(row) <= max_idx:
+                continue
+            if all(row[i] is None for i in REQUEST_COL_IDX.values()):
+                continue
+            rows.append({k: row[i] for k, i in REQUEST_COL_IDX.items()})
+        return rows
+    finally:
+        wb.close()
+
+
 # ---------------------------------------------------------------- 엑셀 출력
 def build_output(template_path, rows, out_path):
     """rows : [{열키: 값}] 을 받아 Sheet1 양식의 새 파일을 만든다.
@@ -367,7 +410,7 @@ def load_price_map(path):
 class PickerDialog(tk.Toplevel):
     """검색 + 목록 선택 공용 팝업."""
 
-    def __init__(self, parent, title, columns, widths, rows, key_index=0):
+    def __init__(self, parent, title, columns, widths, rows, key_index=0, initial=""):
         super().__init__(parent)
         self.title(title)
         self.transient(parent)
@@ -379,7 +422,7 @@ class PickerDialog(tk.Toplevel):
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
         ttk.Label(top, text="검색").pack(side="left")
-        self.var = tk.StringVar()
+        self.var = tk.StringVar(value=initial)
         ent = ttk.Entry(top, textvariable=self.var, width=40)
         ent.pack(side="left", padx=6)
         ent.focus_set()
@@ -458,6 +501,8 @@ class App(tk.Tk):
         self.line_vars = {}
         self.lines = []          # [{열키: 원시 문자열}]
         self.price_map = load_price_map(log_path())   # 자재코드 -> 최근 단가
+        self.request_path = tk.StringVar()
+        self.request_rows = []    # 의뢰파일에서 읽은 dict 리스트
 
         self._build_ui()
         self._load_master(initial=True)
@@ -560,6 +605,12 @@ class App(tk.Tk):
         self.cbo = {}
         self._common_grid(box)
 
+        # 의뢰파일
+        rbox = ttk.LabelFrame(root, text=" 의뢰파일 (더블클릭하면 품목 라인에 자동입력) ",
+                              padding=8)
+        rbox.pack(fill="x", pady=(8, 0))
+        self._request_box(rbox)
+
         # 품목 라인 입력
         lbox = ttk.LabelFrame(root, text=" 품목 라인 (행마다 달라지는 값) ", padding=8)
         lbox.pack(fill="both", expand=True, pady=(8, 0))
@@ -629,6 +680,104 @@ class App(tk.Tk):
             else:
                 ttk.Entry(cell, textvariable=var, width=22).pack(
                     side="left", fill="x", expand=True)
+
+    def _request_box(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x")
+        ttk.Entry(bar, textvariable=self.request_path).pack(
+            side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(bar, text="불러오기", command=self._pick_request_file).pack(side="left")
+        self.request_status = ttk.Label(bar, text="", foreground="#555")
+        self.request_status.pack(side="left", padx=(10, 0))
+
+        cols = ["po", "material", "desc", "qty", "subprocess", "maker", "equip_no", "due"]
+        headers = {"po": "고객PO번호(D)", "material": "Material(F)", "desc": "규격(G)",
+                  "qty": "수량(H)", "subprocess": "세부공정(N)", "maker": "설비Maker(X)",
+                  "equip_no": "설비호기(Z)", "due": "희망납품일(AA)"}
+        widths = {"po": 110, "material": 100, "desc": 220, "qty": 50,
+                 "subprocess": 110, "maker": 90, "equip_no": 90, "due": 90}
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill="x", pady=(6, 0))
+        self.request_tree = ttk.Treeview(wrap, columns=cols, show="headings", height=5)
+        for c in cols:
+            self.request_tree.heading(c, text=headers[c])
+            self.request_tree.column(c, width=widths[c], anchor="w")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=self.request_tree.yview)
+        self.request_tree.configure(yscrollcommand=vs.set)
+        self.request_tree.pack(side="left", fill="both", expand=True)
+        vs.pack(side="left", fill="y")
+        self.request_tree.bind("<Double-1>", self._on_request_dblclick)
+
+    def _pick_request_file(self):
+        p = filedialog.askopenfilename(
+            title="의뢰파일 선택",
+            filetypes=[("Excel", "*.xlsx *.xlsm"), ("모든 파일", "*.*")])
+        if not p:
+            return
+        self.request_path.set(p)
+        self._read_request_file()
+
+    def _read_request_file(self):
+        path = self.request_path.get()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            self.request_rows = load_request_rows(path)
+        except Exception as e:
+            messagebox.showerror("오류", "의뢰파일을 읽지 못했습니다.\n\n%s" % e)
+            return
+        self._refresh_request_tree()
+        self.request_status.config(text="%d건 로드 (더블클릭하면 자동입력)"
+                                   % len(self.request_rows))
+
+    def _refresh_request_tree(self):
+        self.request_tree.delete(*self.request_tree.get_children())
+        for i, r in enumerate(self.request_rows):
+            due = r.get("due")
+            due_text = due.strftime("%Y-%m-%d") if isinstance(due, dt.datetime) else (due or "")
+            self.request_tree.insert("", "end", iid=str(i), values=[
+                r.get("po") if r.get("po") is not None else "",
+                r.get("material") if r.get("material") is not None else "",
+                r.get("desc") if r.get("desc") is not None else "",
+                r.get("qty") if r.get("qty") is not None else "",
+                r.get("subprocess") if r.get("subprocess") is not None else "",
+                r.get("maker") if r.get("maker") is not None else "",
+                r.get("equip_no") if r.get("equip_no") is not None else "",
+                due_text,
+            ])
+
+    def _on_request_dblclick(self, event):
+        sel = self.request_tree.selection()
+        if not sel:
+            return
+        if self.md is None:
+            messagebox.showinfo("안내", "먼저 통합양식을 업로드 하세요.")
+            return
+        r = self.request_rows[int(sel[0])]
+
+        po = r.get("po")
+        if po is not None:
+            iv = parse_int(po)
+            self.line_vars["F"].set(str(iv) if iv is not None else str(po))
+
+        qty = parse_int(r.get("qty"))
+        self.line_qty.set(str(qty) if qty and qty >= 1 else "1")
+
+        if r.get("subprocess") is not None:
+            self.line_vars["O"].set(str(r["subprocess"]).strip())
+        if r.get("maker") is not None:
+            self.line_vars["N"].set(str(r["maker"]).strip())
+        if r.get("equip_no") is not None:
+            self.line_vars["P"].set(str(r["equip_no"]).strip())
+
+        due = r.get("due")
+        if isinstance(due, dt.datetime):
+            self.line_vars["T"].set(due.strftime("%Y-%m-%d"))
+        elif due:
+            self.line_vars["T"].set(format_date_mask(str(due)))
+
+        keyword = extract_after_lot(r.get("desc"))
+        self._pick_fsc(initial_search=keyword)
 
     def _line_form(self, parent):
         form = ttk.Frame(parent)
@@ -792,12 +941,13 @@ class App(tk.Tk):
             lbl.config(text=name if name else ("코드 없음" if code else ""),
                        foreground="#0a6" if name else "#c00")
 
-    def _pick_fsc(self):
+    def _pick_fsc(self, initial_search=""):
         if not self.md:
             return
         dlg = PickerDialog(self, "자재코드(FSC) 선택",
                            ("FSC", "VER", "모델명", "설명", "상태"),
-                           (120, 45, 110, 300, 90), self.md.fsc)
+                           (120, 45, 110, 300, 90), self.md.fsc,
+                           initial=initial_search)
         self.wait_window(dlg)
         if dlg.result:
             self.line_vars["Q"].set(dlg.result)
