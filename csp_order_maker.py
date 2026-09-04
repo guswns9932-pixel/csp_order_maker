@@ -671,6 +671,17 @@ class App(tk.Tk):
             elif key == "Q":
                 ttk.Button(row, text="찾기", width=5,
                            command=self._pick_fsc).pack(side="left", padx=2)
+
+        # 금액(X) 옆 : 이 값으로 몇 행을 한번에 만들지 지정 (기본 1)
+        qty_cell = ttk.Frame(form)
+        qty_cell.grid(row=0, column=len(specs), padx=4, sticky="nw")
+        ttk.Label(qty_cell, text="생성수량").pack(anchor="w")
+        self.line_qty = tk.StringVar(value="1")
+        qty_row = ttk.Frame(qty_cell)
+        qty_row.pack()
+        ttk.Entry(qty_row, textvariable=self.line_qty, width=6,
+                 validate="key", validatecommand=vcmd_digits).pack(side="left")
+
         # 인도처코드(C) 선택시 이름 표시 + 인도장소/고객라인 자동입력
         self.line_vars["C"].trace_add("write", lambda *_: self._on_line_ship_change())
         # 자재코드(Q) 입력시 로그상 최근 단가 자동입력 (없으면 그대로, 수정 가능)
@@ -853,6 +864,8 @@ class App(tk.Tk):
             self.line_vars[k].set("")
         if hasattr(self, "_name_C"):
             self._name_C.config(text="")
+        if hasattr(self, "line_qty"):
+            self.line_qty.set("1")
 
     def _validate_line(self, data):
         errs = []
@@ -878,7 +891,11 @@ class App(tk.Tk):
         if errs:
             messagebox.showwarning("확인 필요", "\n".join(errs))
             return
-        self.lines.append(data)
+        qty = parse_int(self.line_qty.get())
+        if qty is None or qty < 1:
+            qty = 1
+        for _ in range(qty):
+            self.lines.append(dict(data))
         self._refresh_tree()
         # 다음 행 입력 편의를 위해 유지 (자재코드/단가/금액만 새로 입력)
         keep = {k: data[k] for k in ("C", "F", "I", "L", "M", "N", "O", "P", "T")}
