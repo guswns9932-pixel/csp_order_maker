@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# build_exe.py (PyInstaller) 산출물
+build/
+dist/
+*.spec
+
+# 실행 결과로 생성되는 폴더
+CSP 주문접수 UPLOAD/
+
