@@ -11,6 +11,7 @@ CSP 주문접수 업로드 파일 생성기  (알파 v0.1)
 """
 
 import os
+import re
 import sys
 import json
 import datetime as dt
@@ -24,6 +25,7 @@ from openpyxl.utils import get_column_letter
 APP_TITLE = "CSP 주문접수 업로드 파일 생성기  (alpha v0.1)"
 TEMPLATE_NAME = "CSP_주문접수_업로드_통합양식.xlsx"
 SETTINGS_NAME = "csp_order_maker_settings.json"
+LOG_NAME = "CSP_주문접수_전체로그.xlsx"
 
 # ---------------------------------------------------------------- 양식 정의
 # (엑셀열, 헤더명, 필수여부)
@@ -40,8 +42,8 @@ COLUMNS = [
     ("J", "가격결정일", True),
     ("K", "통화", True),
     ("L", "고객라인", False),
-    ("M", "고객설비", False),
-    ("N", "고객공정", False),
+    ("M", "대공정", False),
+    ("N", "설비MAKER", False),
     ("O", "고객세부공정", False),
     ("P", "고객설비호기", True),
     ("Q", "자재코드", True),
@@ -56,13 +58,14 @@ COLUMNS = [
 ]
 
 # 모든 행이 같은 값을 갖는 항목 (화면 위쪽에서 한 번만 입력)
-COMMON_KEYS = ["A", "B", "C", "D", "E", "G", "H", "I", "J", "K",
-               "L", "M", "R", "S", "U", "V", "Y"]
+COMMON_KEYS = ["A", "B", "D", "E", "G", "H", "J", "K",
+               "R", "S", "U", "V", "Y"]
 # 행마다 달라지는 항목 (아래 표에서 행별 입력)
-LINE_KEYS = ["F", "N", "O", "P", "Q", "T", "W", "X"]
+LINE_KEYS = ["C", "F", "I", "L", "M", "N", "O", "P", "Q", "T", "W", "X"]
 
 HEADER_BY_KEY = {k: h for k, h, _ in COLUMNS}
 REQUIRED_KEYS = {k for k, _, r in COLUMNS if r}
+COL_INDEX = {k: i for i, (k, _, _) in enumerate(COLUMNS)}
 
 
 def app_dir():
@@ -89,7 +92,11 @@ class MasterData:
 
     @staticmethod
     def _s(v):
-        return "" if v is None else str(v).strip()
+        if v is None:
+            return ""
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))          # 1000000.0 -> "1000000" (코드값 왜곡 방지)
+        return str(v).strip()
 
     def _code_sheet(self, wb, name, header_rows=2):
         """A=코드, B=내역 형태의 시트를 읽는다."""
@@ -179,6 +186,27 @@ def combo_code(text):
     return str(text).split(" - ", 1)[0].strip()
 
 
+_DIGITS_RE = re.compile(r"\D")
+
+
+def format_date_mask(raw):
+    """입력 중인 문자열을 yyyy-mm-dd 형태로 강제 정렬한다."""
+    digits = _DIGITS_RE.sub("", raw)[:8]
+    if len(digits) <= 4:
+        return digits
+    if len(digits) <= 6:
+        return digits[:4] + "-" + digits[4:]
+    return digits[:4] + "-" + digits[4:6] + "-" + digits[6:]
+
+
+def ship_to_suffix(code):
+    """인도처코드의 '-' 뒤 단어를 뽑아낸다. 예: '삼성전자-16L' -> '16L'"""
+    code = str(code).strip()
+    if "-" not in code:
+        return ""
+    return code.rsplit("-", 1)[-1].strip()
+
+
 # ---------------------------------------------------------------- 엑셀 출력
 def build_output(template_path, rows, out_path):
     """rows : [{열키: 값}] 을 받아 Sheet1 양식의 새 파일을 만든다."""
@@ -212,13 +240,63 @@ def build_output(template_path, rows, out_path):
     for r, data in enumerate(rows, start=2):
         for idx, (key, _, _) in enumerate(COLUMNS, start=1):
             cell = ws.cell(row=r, column=idx, value=data.get(key))
-            if key in ("G", "J"):          # 텍스트 형식 YYYYMMDD
-                cell.number_format = "@"
-            elif key == "T":               # 엑셀 날짜값
-                cell.number_format = "yyyy-mm-dd"
+            if key in ("G", "J", "T"):     # 텍스트 형식 (업로드 시스템이 날짜형 셀을
+                cell.number_format = "@"   # 그대로 인식하지 못하므로 문자열로 고정)
 
     wb.save(out_path)
     return out_path
+
+
+# ---------------------------------------------------------------- 전체 로그
+def log_path():
+    return os.path.join(app_dir(), LOG_NAME)
+
+
+def append_log(path, rows, source_name):
+    """생성될 때마다 rows 를 통합 로그 파일 뒤에 쌓는다."""
+    if os.path.exists(path):
+        wb = load_workbook(path)
+        ws = wb.active
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "로그"
+        ws.append(["생성일시", "생성파일"] + [h for _, h, _ in COLUMNS])
+
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    start_row = ws.max_row + 1
+    for row in rows:
+        ws.append([ts, source_name] + [row.get(k) for k, _, _ in COLUMNS])
+    for r in range(start_row, ws.max_row + 1):
+        for key in ("G", "J", "T"):
+            ws.cell(row=r, column=3 + COL_INDEX[key]).number_format = "@"
+
+    wb.save(path)
+
+
+def load_price_map(path):
+    """로그 파일을 읽어 자재코드 -> 가장 최근 단가 매핑을 만든다."""
+    prices = {}
+    if not os.path.exists(path):
+        return prices
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return prices
+    try:
+        ws = wb.active
+        q_idx = 2 + COL_INDEX["Q"]
+        w_idx = 2 + COL_INDEX["W"]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if len(row) <= max(q_idx, w_idx):
+                continue
+            code, price = row[q_idx], row[w_idx]
+            if code is None or price is None:
+                continue
+            prices[str(code).strip()] = price   # 아래로 갈수록 최신값이라 덮어쓰면 됨
+    finally:
+        wb.close()
+    return prices
 
 
 # ---------------------------------------------------------------- 검색 팝업
@@ -316,6 +394,7 @@ class App(tk.Tk):
         self.line_vars = {}
         self.lines = []          # [{열키: 원시 문자열}]
         self.editing_index = None
+        self.price_map = load_price_map(log_path())   # 자재코드 -> 최근 단가
 
         self._build_ui()
         self._load_master(initial=True)
@@ -352,6 +431,12 @@ class App(tk.Tk):
         self.cbo["H"]["values"] = items(self.md.inco_terms)
         self.cbo["K"]["values"] = items(self.md.currencies)
         self.cbo["Y"]["values"] = items(self.md.comm_types)
+
+        # 드롭다운은 최초에 첫 항목이 선택되어 있도록 한다 (이미 값이 있으면 유지)
+        for key in ("A", "D", "H", "K", "Y"):
+            values = self.cbo[key]["values"]
+            if values and not self.common_vars[key].get().strip():
+                self.common_vars[key].set(values[0])
 
     # ---------- 화면 구성
     def _build_ui(self):
@@ -394,9 +479,8 @@ class App(tk.Tk):
     def _common_grid(self, parent):
         """공통값 입력칸을 4열로 배치."""
         specs = [
-            ("A", "combo"), ("B", "pick_sold"), ("C", "pick_ship"), ("D", "combo"),
-            ("E", "entry"), ("G", "date8"), ("H", "combo"), ("I", "entry"),
-            ("J", "date8"), ("K", "combo"), ("L", "entry"), ("M", "entry"),
+            ("A", "combo"), ("B", "pick_sold"), ("D", "combo"), ("E", "entry"),
+            ("G", "date8"), ("H", "combo"), ("J", "date8"), ("K", "combo"),
             ("R", "fixed"), ("S", "entry"), ("U", "entry"), ("V", "entry"),
             ("Y", "combo"),
         ]
@@ -405,7 +489,7 @@ class App(tk.Tk):
             r, c = divmod(i, 4)
             cell = ttk.Frame(parent)
             cell.grid(row=r, column=c, sticky="ew", padx=6, pady=3)
-            parent.columnconfigure(c, weight=1)
+            parent.columnconfigure(c, weight=1, minsize=220)
 
             label = HEADER_BY_KEY[key]
             if key in REQUIRED_KEYS:
@@ -419,15 +503,17 @@ class App(tk.Tk):
                 w = ttk.Combobox(cell, textvariable=var, state="readonly", width=22)
                 w.pack(side="left", fill="x", expand=True)
                 self.cbo[key] = w
-            elif kind in ("pick_sold", "pick_ship"):
-                ttk.Entry(cell, textvariable=var, width=12).pack(side="left")
-                lbl = ttk.Label(cell, text="", foreground="#0a6", width=14)
-                lbl.pack(side="left", padx=3)
-                setattr(self, "_name_%s" % key, lbl)
-                which = "sold" if kind == "pick_sold" else "ship"
+            elif kind == "pick_sold":
+                # 창이 좁아져도 '찾기' 버튼이 가장 먼저 자리를 확보하도록
+                # 오른쪽에 먼저 배치하고, 이름 표시 라벨이 남는 공간을 흡수/축소한다.
                 ttk.Button(cell, text="찾기", width=5,
-                           command=lambda w=which: self._pick_partner(w)).pack(side="left")
-                var.trace_add("write", lambda *_a, k=key: self._show_partner_name(k))
+                           command=lambda v=var: self._pick_partner("sold", v)
+                           ).pack(side="right")
+                ttk.Entry(cell, textvariable=var, width=12).pack(side="left")
+                lbl = ttk.Label(cell, text="", foreground="#0a6")
+                lbl.pack(side="left", fill="x", expand=True, padx=3)
+                self._name_B = lbl
+                var.trace_add("write", lambda *_a: self._show_partner_name("B"))
             elif kind == "fixed":
                 e = ttk.Entry(cell, textvariable=var, width=22, state="readonly")
                 e.pack(side="left", fill="x", expand=True)
@@ -438,11 +524,12 @@ class App(tk.Tk):
     def _line_form(self, parent):
         form = ttk.Frame(parent)
         form.pack(fill="x")
-        specs = [("F", 14), ("N", 10), ("O", 16), ("P", 12),
-                 ("Q", 16), ("T", 12), ("W", 12), ("X", 12)]
+        specs = [("C", 12), ("F", 12), ("I", 8), ("L", 8),
+                 ("M", 10), ("N", 12), ("O", 14), ("P", 10),
+                 ("Q", 14), ("T", 12), ("W", 10), ("X", 10)]
         for i, (key, width) in enumerate(specs):
             cell = ttk.Frame(form)
-            cell.grid(row=0, column=i, padx=4, sticky="w")
+            cell.grid(row=0, column=i, padx=4, sticky="nw")
             label = HEADER_BY_KEY[key]
             if key in REQUIRED_KEYS:
                 label = "* " + label
@@ -452,15 +539,27 @@ class App(tk.Tk):
             row = ttk.Frame(cell)
             row.pack()
             ttk.Entry(row, textvariable=var, width=width).pack(side="left")
-            if key == "Q":
+            if key == "C":
+                ttk.Button(row, text="찾기", width=5,
+                           command=self._pick_line_ship).pack(side="left", padx=2)
+                self._name_C = ttk.Label(cell, text="", foreground="#0a6")
+                self._name_C.pack(anchor="w")
+            elif key == "Q":
                 ttk.Button(row, text="찾기", width=5,
                            command=self._pick_fsc).pack(side="left", padx=2)
+        # 인도처코드(C) 선택시 이름 표시 + 인도장소/고객라인 자동입력
+        self.line_vars["C"].trace_add("write", lambda *_: self._on_line_ship_change())
+        # 자재코드(Q) 입력시 로그상 최근 단가 자동입력 (없으면 그대로, 수정 가능)
+        self.line_vars["Q"].trace_add("write", lambda *_: self._auto_price())
         # 단가 -> 금액 자동
         self.line_vars["W"].trace_add("write", lambda *_: self._auto_amount())
+        # 납품요청일 입력 형식을 yyyy-mm-dd 로 고정
+        self._t_guard = False
+        self.line_vars["T"].trace_add("write", lambda *_: self._on_date_input())
 
         btns = ttk.Frame(parent)
         btns.pack(fill="x", pady=(6, 6))
-        ttk.Label(btns, text="납품요청일은 20261026 또는 2026-10-26 형식",
+        ttk.Label(btns, text="납품요청일은 입력 즉시 yyyy-mm-dd 형식으로 정렬됩니다",
                   foreground="#777").pack(side="left")
         self.btn_add = ttk.Button(btns, text="행 추가", command=self._add_line)
         self.btn_add.pack(side="right")
@@ -470,12 +569,15 @@ class App(tk.Tk):
     def _line_table(self, parent):
         wrap = ttk.Frame(parent)
         wrap.pack(fill="both", expand=True)
-        cols = ["No"] + LINE_KEYS
-        self.tree = ttk.Treeview(wrap, columns=cols, show="headings", height=12)
+        cols = ["선택", "No"] + LINE_KEYS
+        self.tree = ttk.Treeview(wrap, columns=cols, show="headings",
+                                 height=12, selectmode="extended")
+        self.tree.heading("선택", text="선택")
+        self.tree.column("선택", width=40, anchor="center")
         self.tree.heading("No", text="No")
         self.tree.column("No", width=40, anchor="center")
-        widths = {"F": 110, "N": 80, "O": 130, "P": 100,
-                  "Q": 130, "T": 100, "W": 110, "X": 110}
+        widths = {"C": 110, "F": 100, "I": 80, "L": 80, "M": 90, "N": 110,
+                  "O": 120, "P": 100, "Q": 120, "T": 100, "W": 100, "X": 100}
         for k in LINE_KEYS:
             self.tree.heading(k, text=HEADER_BY_KEY[k])
             self.tree.column(k, width=widths[k], anchor="w")
@@ -484,6 +586,8 @@ class App(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="left", fill="y")
         self.tree.bind("<Double-1>", lambda e: self._edit_line())
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<<TreeviewSelect>>", self._refresh_checks)
 
         tb = ttk.Frame(parent)
         tb.pack(fill="x", pady=(6, 0))
@@ -503,18 +607,38 @@ class App(tk.Tk):
             self.master_path.set(p)
             self._load_master()
 
-    def _pick_partner(self, which):
+    def _pick_partner(self, which, var):
         if not self.md:
             return
         if which == "sold":
-            rows, title, key = self.md.sold_to, "판매처 선택", "B"
+            rows, title = self.md.sold_to, "판매처 선택"
         else:
-            rows, title, key = self.md.ship_to, "인도처 선택", "C"
+            rows, title = self.md.ship_to, "인도처 선택"
         dlg = PickerDialog(self, title, ("코드", "이름", "주소"),
                            (90, 220, 220), rows)
         self.wait_window(dlg)
         if dlg.result:
-            self.common_vars[key].set(dlg.result)
+            var.set(dlg.result)
+
+    def _pick_line_ship(self):
+        self._pick_partner("ship", self.line_vars["C"])
+
+    def _on_line_ship_change(self):
+        code = self.line_vars["C"].get().strip()
+        name = ""
+        if self.md:
+            name = next((r[1] for r in self.md.ship_to if r[0] == code), "")
+        if hasattr(self, "_name_C"):
+            self._name_C.config(text=name if name else ("코드 없음" if code else ""),
+                                foreground="#0a6" if name else "#c00")
+        # 인도장소(I)/고객라인(L)은 인도처코드의 '-' 뒤 단어를 최초값으로 사용한다.
+        # (동일한 값으로 채워지되, 이후 각각 자유롭게 수정 가능)
+        suffix = ship_to_suffix(code)
+        if suffix:
+            if not self.line_vars["I"].get().strip():
+                self.line_vars["I"].set(suffix)
+            if not self.line_vars["L"].get().strip():
+                self.line_vars["L"].set(suffix)
 
     def _show_partner_name(self, key):
         if not self.md:
@@ -542,9 +666,29 @@ class App(tk.Tk):
         if w is not None:
             self.line_vars["X"].set(str(w))
 
+    def _auto_price(self):
+        code = self.line_vars["Q"].get().strip()
+        if not code:
+            return
+        price = self.price_map.get(code)
+        if price is not None and not self.line_vars["W"].get().strip():
+            self.line_vars["W"].set(str(price))
+
+    def _on_date_input(self):
+        if self._t_guard:
+            return
+        raw = self.line_vars["T"].get()
+        fixed = format_date_mask(raw)
+        if fixed != raw:
+            self._t_guard = True
+            self.line_vars["T"].set(fixed)
+            self._t_guard = False
+
     def _clear_line_form(self):
         for k in LINE_KEYS:
             self.line_vars[k].set("")
+        if hasattr(self, "_name_C"):
+            self._name_C.config(text="")
         self.editing_index = None
         self.btn_add.config(text="행 추가")
 
@@ -553,11 +697,14 @@ class App(tk.Tk):
         for k in LINE_KEYS:
             if k in REQUIRED_KEYS and not data[k].strip():
                 errs.append("%s(%s) 은(는) 필수입니다." % (HEADER_BY_KEY[k], k))
+        c = data["C"].strip()
+        if c and self.md and c not in {r[0] for r in self.md.ship_to}:
+            errs.append("인도처코드 '%s' 은(는) 목록에 없습니다." % c)
         q = data["Q"].strip()
         if q and self.md and q not in self.md.fsc_codes:
             errs.append("자재코드 '%s' 은(는) FSC 목록에 없습니다." % q)
         if data["T"].strip() and parse_date(data["T"]) is None:
-            errs.append("납품요청일 형식이 올바르지 않습니다. (예: 20261026)")
+            errs.append("납품요청일 형식이 올바르지 않습니다. (예: 2026-10-26)")
         for k in ("W", "X"):
             if data[k].strip() and parse_int(data[k]) is None:
                 errs.append("%s 은(는) 숫자여야 합니다." % HEADER_BY_KEY[k])
@@ -574,16 +721,40 @@ class App(tk.Tk):
         else:
             self.lines[self.editing_index] = data
         self._refresh_tree()
-        keep = {k: data[k] for k in ("F", "N", "O", "P", "T")}
+        # 다음 행 입력 편의를 위해 유지 (자재코드/단가/금액만 새로 입력)
+        keep = {k: data[k] for k in ("C", "F", "I", "L", "M", "N", "O", "P", "T")}
         self._clear_line_form()
-        for k, v in keep.items():          # 다음 행 입력 편의를 위해 유지
+        for k, v in keep.items():
             self.line_vars[k].set(v)
 
+    def _selected_indices(self):
+        return sorted(self.tree.index(iid) for iid in self.tree.selection())
+
     def _selected_index(self):
-        sel = self.tree.selection()
-        if not sel:
-            return None
-        return self.tree.index(sel[0])
+        idxs = self._selected_indices()
+        return idxs[0] if idxs else None
+
+    def _on_tree_click(self, event):
+        """'선택' 열을 클릭하면 다중 선택을 켜고 끈다 (체크박스처럼 동작)."""
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        row = self.tree.identify_row(event.y)
+        if not row or col != "#1":
+            return
+        if row in self.tree.selection():
+            self.tree.selection_remove(row)
+        else:
+            self.tree.selection_add(row)
+        return "break"
+
+    def _refresh_checks(self, *_):
+        sel = set(self.tree.selection())
+        for iid in self.tree.get_children():
+            vals = list(self.tree.item(iid, "values"))
+            vals[0] = "☑" if iid in sel else "☐"
+            self.tree.item(iid, values=vals)
 
     def _edit_line(self):
         i = self._selected_index()
@@ -595,17 +766,20 @@ class App(tk.Tk):
         self.btn_add.config(text="수정 반영")
 
     def _dup_line(self):
-        i = self._selected_index()
-        if i is None:
+        """선택된 행(여러 행 가능)을 각각 바로 아래에 복제한다."""
+        idxs = self._selected_indices()
+        if not idxs:
             return
-        self.lines.insert(i + 1, dict(self.lines[i]))
+        for i in sorted(idxs, reverse=True):
+            self.lines.insert(i + 1, dict(self.lines[i]))
         self._refresh_tree()
 
     def _del_line(self):
-        i = self._selected_index()
-        if i is None:
+        idxs = self._selected_indices()
+        if not idxs:
             return
-        del self.lines[i]
+        for i in sorted(idxs, reverse=True):
+            del self.lines[i]
         self._clear_line_form()
         self._refresh_tree()
 
@@ -618,7 +792,7 @@ class App(tk.Tk):
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         for n, d in enumerate(self.lines, start=1):
-            self.tree.insert("", "end", values=[n] + [d[k] for k in LINE_KEYS])
+            self.tree.insert("", "end", values=["☐", n] + [d[k] for k in LINE_KEYS])
         self.line_count.config(text="%d 행" % len(self.lines))
 
     # ---------- 출력
@@ -633,8 +807,6 @@ class App(tk.Tk):
             out[k] = raw
         if out.get("B") and self.md and out["B"] not in {r[0] for r in self.md.sold_to}:
             errs.append("판매처코드 '%s' 은(는) 목록에 없습니다." % out["B"])
-        if out.get("C") and self.md and out["C"] not in {r[0] for r in self.md.ship_to}:
-            errs.append("인도처코드 '%s' 은(는) 목록에 없습니다." % out["C"])
         for k in ("G", "J"):
             if out[k]:
                 d = parse_date(out[k])
@@ -645,22 +817,23 @@ class App(tk.Tk):
         return out, errs
 
     def _build_rows(self, common):
+        # 판매처/인도처 등 코드값은 실제 입력/선택된 문자열 그대로 저장한다.
+        # (과거에는 숫자로만 이루어진 코드를 정수로 변환했는데, 앞자리 0이
+        #  잘려나가 업로드 시스템이 값을 인식하지 못하는 원인이 되었다.)
         rows = []
         for d in self.lines:
             row = {}
             for k in COMMON_KEYS:
                 v = common[k]
-                if k in ("B", "C", "D", "E", "U"):
-                    iv = parse_int(v)
-                    v = iv if iv is not None else (v or None)
-                elif k == "R":
+                if k == "R":
                     v = 1                       # 오더수량은 항상 1
                 row[k] = v if v != "" else None
             for k in LINE_KEYS:
                 v = d[k]
                 if k == "T":
-                    v = parse_date(v)
-                elif k in ("F", "W", "X"):
+                    dv = parse_date(v)
+                    v = dv.strftime("%Y-%m-%d") if dv else None
+                elif k in ("W", "X"):
                     iv = parse_int(v)
                     v = iv if iv is not None else (v or None)
                 row[k] = v if v != "" else None
@@ -688,13 +861,20 @@ class App(tk.Tk):
             initialfile=default, filetypes=[("Excel", "*.xlsx")])
         if not out:
             return
+        rows = self._build_rows(common)
         try:
-            build_output(self.master_path.get(), self._build_rows(common), out)
+            build_output(self.master_path.get(), rows, out)
+            append_log(log_path(), rows, os.path.basename(out))
         except Exception as e:
             messagebox.showerror("오류", "파일 생성에 실패했습니다.\n\n%s" % e)
             return
+        for row in rows:                   # 다음 입력을 위해 최근 단가를 갱신
+            q, w = row.get("Q"), row.get("W")
+            if q and w is not None:
+                self.price_map[str(q)] = w
         self.status.config(text="생성 완료 : %s" % out)
-        messagebox.showinfo("완료", "%d행이 생성되었습니다.\n\n%s" % (len(self.lines), out))
+        messagebox.showinfo("완료", "%d행이 생성되었습니다.\n전체 로그에 누적 저장되었습니다.\n\n%s"
+                             % (len(self.lines), out))
 
     # ---------- 설정 저장 / 복원
     def _settings_path(self):
