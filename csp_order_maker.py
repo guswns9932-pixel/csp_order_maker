@@ -141,13 +141,18 @@ class MasterData:
                     code = self._s(row[1])          # B열 : FSC
                     if not code or code in seen:
                         continue
+                    status = self._s(row[10])       # K열 : 상태
+                    if code.upper().startswith("D"):
+                        continue                    # D로 시작하는 FSC는 검색 대상 제외
+                    if status != "BOM활성화":
+                        continue                    # 상태가 'BOM활성화'인 것만 검색 대상
                     seen.add(code)
                     self.fsc.append((
                         code,
                         self._s(row[2]),            # C열 : VER
                         self._s(row[5]),            # F열 : FSC NM
                         self._s(row[7]).replace("\n", " "),   # H열 : 설명
-                        self._s(row[10]),           # K열 : 상태
+                        status,
                     ))
         finally:
             wb.close()
@@ -197,6 +202,22 @@ def format_date_mask(raw):
     if len(digits) <= 6:
         return digits[:4] + "-" + digits[4:]
     return digits[:4] + "-" + digits[4:6] + "-" + digits[6:]
+
+
+def cursor_after_mask(fixed, digit_count):
+    """포맷팅 후 문자열에서, 원래 커서 앞에 있던 숫자 개수(digit_count) 만큼
+    지나간 위치를 계산한다. 자동으로 붙는 '-' 뒤로 커서를 옮겨줘서
+    숫자를 입력할 때마다 커서가 뒤로 튀는 현상을 막는다."""
+    seen = 0
+    i = 0
+    n = len(fixed)
+    while i < n and seen < digit_count:
+        if fixed[i].isdigit():
+            seen += 1
+        i += 1
+    if i < n and fixed[i] == "-":
+        i += 1
+    return i
 
 
 def ship_to_suffix(code):
@@ -393,7 +414,6 @@ class App(tk.Tk):
         self.common_vars = {}
         self.line_vars = {}
         self.lines = []          # [{열키: 원시 문자열}]
-        self.editing_index = None
         self.price_map = load_price_map(log_path())   # 자재코드 -> 최근 단가
 
         self._build_ui()
@@ -484,7 +504,9 @@ class App(tk.Tk):
             ("R", "fixed"), ("S", "entry"), ("U", "entry"), ("V", "entry"),
             ("Y", "combo"),
         ]
-        defaults = {"E": "10", "R": "1", "S": "EA", "U": "1100", "V": "PR00"}
+        today = dt.date.today().strftime("%Y%m%d")
+        defaults = {"E": "10", "G": today, "R": "1", "S": "EA",
+                    "U": "1100", "V": "PR00"}
         for i, (key, kind) in enumerate(specs):
             r, c = divmod(i, 4)
             cell = ttk.Frame(parent)
@@ -496,7 +518,12 @@ class App(tk.Tk):
                 label = "* " + label
             ttk.Label(cell, text="%s (%s)" % (label, key), width=16).pack(side="left")
 
-            var = tk.StringVar(value=defaults.get(key, ""))
+            if key == "J":
+                # 고객PO일자(G)와 가격결정일(J)은 항상 같은 값을 쓰므로
+                # 변수를 공유해서 어느 한쪽을 고치면 즉시 서로 같아지게 한다.
+                var = self.common_vars["G"]
+            else:
+                var = tk.StringVar(value=defaults.get(key, ""))
             self.common_vars[key] = var
 
             if kind == "combo":
@@ -524,6 +551,8 @@ class App(tk.Tk):
     def _line_form(self, parent):
         form = ttk.Frame(parent)
         form.pack(fill="x")
+        # 고객PO번호는 숫자만 입력되도록 키 입력 단계에서 걸러낸다.
+        vcmd_digits = (self.register(lambda p: p == "" or p.isdigit()), "%P")
         specs = [("C", 12), ("F", 12), ("I", 8), ("L", 8),
                  ("M", 10), ("N", 12), ("O", 14), ("P", 10),
                  ("Q", 14), ("T", 12), ("W", 10), ("X", 10)]
@@ -538,7 +567,14 @@ class App(tk.Tk):
             self.line_vars[key] = var
             row = ttk.Frame(cell)
             row.pack()
-            ttk.Entry(row, textvariable=var, width=width).pack(side="left")
+            if key == "F":
+                entry = ttk.Entry(row, textvariable=var, width=width,
+                                  validate="key", validatecommand=vcmd_digits)
+            else:
+                entry = ttk.Entry(row, textvariable=var, width=width)
+            entry.pack(side="left")
+            if key == "T":
+                self.entry_T = entry
             if key == "C":
                 ttk.Button(row, text="찾기", width=5,
                            command=self._pick_line_ship).pack(side="left", padx=2)
@@ -559,7 +595,10 @@ class App(tk.Tk):
 
         btns = ttk.Frame(parent)
         btns.pack(fill="x", pady=(6, 6))
-        ttk.Label(btns, text="납품요청일은 입력 즉시 yyyy-mm-dd 형식으로 정렬됩니다",
+        ttk.Label(btns,
+                  text="납품요청일은 입력 즉시 yyyy-mm-dd 형식으로 정렬됩니다 · "
+                       "여러 행을 체크한 뒤 [선택 행에 반영]을 누르면 아래 입력칸의 "
+                       "값이 체크된 모든 행에 그대로 적용됩니다",
                   foreground="#777").pack(side="left")
         self.btn_add = ttk.Button(btns, text="행 추가", command=self._add_line)
         self.btn_add.pack(side="right")
@@ -585,16 +624,18 @@ class App(tk.Tk):
         self.tree.configure(yscrollcommand=vs.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="left", fill="y")
-        self.tree.bind("<Double-1>", lambda e: self._edit_line())
+        self.tree.bind("<Double-1>", lambda e: self._load_selected())
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<<TreeviewSelect>>", self._refresh_checks)
 
         tb = ttk.Frame(parent)
         tb.pack(fill="x", pady=(6, 0))
-        ttk.Button(tb, text="선택 행 수정", command=self._edit_line).pack(side="left")
-        ttk.Button(tb, text="선택 행 복제", command=self._dup_line).pack(side="left", padx=6)
-        ttk.Button(tb, text="선택 행 삭제", command=self._del_line).pack(side="left")
-        ttk.Button(tb, text="전체 삭제", command=self._clear_lines).pack(side="left", padx=6)
+        ttk.Button(tb, text="선택 행 불러오기", command=self._load_selected).pack(side="left")
+        ttk.Button(tb, text="선택 행에 반영", command=self._apply_to_selected).pack(
+            side="left", padx=6)
+        ttk.Button(tb, text="선택 행 복제", command=self._dup_line).pack(side="left")
+        ttk.Button(tb, text="선택 행 삭제", command=self._del_line).pack(side="left", padx=6)
+        ttk.Button(tb, text="전체 삭제", command=self._clear_lines).pack(side="left")
         self.line_count = ttk.Label(tb, text="0 행")
         self.line_count.pack(side="right")
 
@@ -633,7 +674,9 @@ class App(tk.Tk):
                                 foreground="#0a6" if name else "#c00")
         # 인도장소(I)/고객라인(L)은 인도처코드의 '-' 뒤 단어를 최초값으로 사용한다.
         # (동일한 값으로 채워지되, 이후 각각 자유롭게 수정 가능)
-        suffix = ship_to_suffix(code)
+        # 인도처코드 자체는 순수 숫자(엑셀 숫자로 저장되어야 함)라 '-'가 없는
+        # 경우가 많으므로, 코드에 없으면 이름(예: '삼성전자-16L')에서도 찾는다.
+        suffix = ship_to_suffix(code) or ship_to_suffix(name)
         if suffix:
             if not self.line_vars["I"].get().strip():
                 self.line_vars["I"].set(suffix)
@@ -679,9 +722,31 @@ class App(tk.Tk):
             return
         raw = self.line_vars["T"].get()
         fixed = format_date_mask(raw)
-        if fixed != raw:
-            self._t_guard = True
-            self.line_vars["T"].set(fixed)
+        if fixed == raw:
+            return
+        entry = getattr(self, "entry_T", None)
+        try:
+            cursor = entry.index("insert") if entry is not None else len(raw)
+        except tk.TclError:
+            cursor = len(raw)
+        digit_count = len(_DIGITS_RE.sub("", raw[:cursor]))
+        self._t_guard = True
+        self.line_vars["T"].set(fixed)
+
+        def _fix_cursor():
+            # Entry 위젯 자체의 삽입 후처리가 이 트레이스보다 나중에 커서를
+            # 재배치하므로, 이벤트 루프가 한 번 돈 뒤(after_idle)에 다시
+            # 올바른 위치로 옮겨야 덮어써지지 않는다.
+            if entry is not None:
+                try:
+                    entry.icursor(cursor_after_mask(fixed, digit_count))
+                except tk.TclError:
+                    pass
+            self._t_guard = False
+
+        if entry is not None:
+            entry.after_idle(_fix_cursor)
+        else:
             self._t_guard = False
 
     def _clear_line_form(self):
@@ -689,8 +754,6 @@ class App(tk.Tk):
             self.line_vars[k].set("")
         if hasattr(self, "_name_C"):
             self._name_C.config(text="")
-        self.editing_index = None
-        self.btn_add.config(text="행 추가")
 
     def _validate_line(self, data):
         errs = []
@@ -716,10 +779,7 @@ class App(tk.Tk):
         if errs:
             messagebox.showwarning("확인 필요", "\n".join(errs))
             return
-        if self.editing_index is None:
-            self.lines.append(data)
-        else:
-            self.lines[self.editing_index] = data
+        self.lines.append(data)
         self._refresh_tree()
         # 다음 행 입력 편의를 위해 유지 (자재코드/단가/금액만 새로 입력)
         keep = {k: data[k] for k in ("C", "F", "I", "L", "M", "N", "O", "P", "T")}
@@ -756,14 +816,31 @@ class App(tk.Tk):
             vals[0] = "☑" if iid in sel else "☐"
             self.tree.item(iid, values=vals)
 
-    def _edit_line(self):
+    def _load_selected(self):
+        """체크(선택)된 행 중 첫 번째 행의 값을 입력칸으로 불러온다."""
         i = self._selected_index()
         if i is None:
             return
         for k in LINE_KEYS:
             self.line_vars[k].set(self.lines[i][k])
-        self.editing_index = i
-        self.btn_add.config(text="수정 반영")
+
+    def _apply_to_selected(self):
+        """입력칸의 값을 지금 체크되어 있는 모든 행에 그대로 반영한다.
+        체크 표시가 곧 적용 대상이므로 둘이 어긋날 일이 없다."""
+        idxs = self._selected_indices()
+        if not idxs:
+            messagebox.showwarning("확인 필요", "반영할 행을 먼저 체크하세요.")
+            return
+        data = {k: self.line_vars[k].get().strip() for k in LINE_KEYS}
+        errs = self._validate_line(data)
+        if errs:
+            messagebox.showwarning("확인 필요", "\n".join(errs))
+            return
+        for i in idxs:
+            self.lines[i] = dict(data)
+        self._refresh_tree()
+        kids = self.tree.get_children()
+        self.tree.selection_set([kids[i] for i in idxs])
 
     def _dup_line(self):
         """선택된 행(여러 행 가능)을 각각 바로 아래에 복제한다."""
@@ -817,20 +894,26 @@ class App(tk.Tk):
         return out, errs
 
     def _build_rows(self, common):
-        # 판매처/인도처 등 코드값은 실제 입력/선택된 문자열 그대로 저장한다.
-        # (과거에는 숫자로만 이루어진 코드를 정수로 변환했는데, 앞자리 0이
-        #  잘려나가 업로드 시스템이 값을 인식하지 못하는 원인이 되었다.)
+        # 판매처코드/인도처코드/유통경로/제품군/출하지점은 업로드 시스템이
+        # 반드시 엑셀 숫자 형식으로 인식해야 하므로 정수로 변환해 저장한다.
+        # (숫자로 변환되지 않는 값은 원래 문자열을 그대로 둔다)
         rows = []
         for d in self.lines:
             row = {}
             for k in COMMON_KEYS:
                 v = common[k]
-                if k == "R":
+                if k in ("B", "D", "E", "U"):
+                    iv = parse_int(v)
+                    v = iv if iv is not None else (v or None)
+                elif k == "R":
                     v = 1                       # 오더수량은 항상 1
                 row[k] = v if v != "" else None
             for k in LINE_KEYS:
                 v = d[k]
-                if k == "T":
+                if k == "C":
+                    iv = parse_int(v)
+                    v = iv if iv is not None else (v or None)
+                elif k == "T":
                     dv = parse_date(v)
                     v = dv.strftime("%Y-%m-%d") if dv else None
                 elif k in ("W", "X"):
