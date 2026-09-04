@@ -89,6 +89,7 @@ class MasterData:
         self.comm_types = []
         self.fsc = []              # [(FSC, VER, FSC NM, 설명, 상태)]
         self.fsc_filter_note = ""  # 필터가 완화/생략된 경우의 안내 문구
+        self.cip_fsc = set()       # CIP 시트 J열(AS-IS FSC)에 등장하는 값들
         self._load()
 
     @staticmethod
@@ -179,6 +180,20 @@ class MasterData:
                         % len(candidates))
                 else:
                     self.fsc, self.fsc_filter_note = [], ""
+
+            if "CIP" in wb.sheetnames:
+                ws = wb["CIP"]
+                cip_fsc = set()
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    # CIP 시트는 머리글이 여러 줄이라 고정 행번호로 자르는 대신
+                    # No. 열(B, 데이터행에서만 숫자)로 실제 데이터행을 가려낸다.
+                    no = row[1] if len(row) > 1 else None
+                    if not isinstance(no, (int, float)):
+                        continue
+                    j_val = self._s(row[9]) if len(row) > 9 else ""   # J열 : AS-IS FSC
+                    if j_val:
+                        cip_fsc.add(j_val)
+                self.cip_fsc = cip_fsc
         finally:
             wb.close()
 
@@ -253,9 +268,14 @@ def ship_to_suffix(code):
     return code.rsplit("-", 1)[-1].strip()
 
 
+RED_FONT = Font(color="FFFF0000")
+
+
 # ---------------------------------------------------------------- 엑셀 출력
-def build_output(template_path, rows, out_path):
-    """rows : [{열키: 값}] 을 받아 Sheet1 양식의 새 파일을 만든다."""
+def build_output(template_path, rows, out_path, cip_fsc=None):
+    """rows : [{열키: 값}] 을 받아 Sheet1 양식의 새 파일을 만든다.
+    cip_fsc 가 주어지면, 자재코드(Q)가 그 집합에 완전히 일치할 때
+    해당 셀 글자를 빨간색으로 표시한다 (CIP 시트 AS-IS FSC 경고)."""
     tpl = load_workbook(template_path)
     tws = tpl["Sheet1"]
 
@@ -288,6 +308,8 @@ def build_output(template_path, rows, out_path):
             cell = ws.cell(row=r, column=idx, value=data.get(key))
             if key in ("G", "J", "T"):     # 텍스트 형식 (업로드 시스템이 날짜형 셀을
                 cell.number_format = "@"   # 그대로 인식하지 못하므로 문자열로 고정)
+            if key == "Q" and cip_fsc and str(data.get(key) or "") in cip_fsc:
+                cell.font = RED_FONT
 
     wb.save(out_path)
     return out_path
@@ -532,8 +554,11 @@ class App(tk.Tk):
                    command=lambda: self._load_master()).pack(side="left", padx=4)
 
         # 공통값
-        box = ttk.LabelFrame(root, text=" 공통값 (모든 행에 동일하게 들어감) ",
-                             padding=8)
+        common_head = ttk.Frame(root)
+        ttk.Label(common_head, text=" 공통값 (모든 행에 동일하게 들어감) ").pack(side="left")
+        ttk.Button(common_head, text="공통값 고정",
+                   command=self._save_settings).pack(side="left", padx=(6, 0))
+        box = ttk.LabelFrame(root, labelwidget=common_head, padding=8)
         box.pack(fill="x")
         self._common_box = box
         self.cbo = {}
@@ -553,8 +578,6 @@ class App(tk.Tk):
         self.status.pack(side="left")
         ttk.Button(bottom, text="엑셀 파일 생성",
                    command=self._export).pack(side="right")
-        ttk.Button(bottom, text="공통값 저장",
-                   command=self._save_settings).pack(side="right", padx=6)
 
         # 양식을 아직 불러오기 전에는 입력칸을 잠그고, 클릭하면 안내 문구를 띄운다.
         self.bind_all("<Button-1>", self._on_locked_click, add="+")
@@ -638,6 +661,8 @@ class App(tk.Tk):
             entry.pack(side="left")
             if key == "T":
                 self.entry_T = entry
+            elif key == "Q":
+                self.entry_Q = entry
             if key == "C":
                 ttk.Button(row, text="찾기", width=5,
                            command=self._pick_line_ship).pack(side="left", padx=2)
@@ -650,6 +675,8 @@ class App(tk.Tk):
         self.line_vars["C"].trace_add("write", lambda *_: self._on_line_ship_change())
         # 자재코드(Q) 입력시 로그상 최근 단가 자동입력 (없으면 그대로, 수정 가능)
         self.line_vars["Q"].trace_add("write", lambda *_: self._auto_price())
+        # 자재코드(Q)가 CIP 시트의 AS-IS FSC와 일치하면 빨간 글씨로 경고
+        self.line_vars["Q"].trace_add("write", lambda *_: self._check_cip_warning())
         # 단가 -> 금액 자동
         self.line_vars["W"].trace_add("write", lambda *_: self._auto_amount())
         # 납품요청일 입력 형식을 yyyy-mm-dd 로 고정
@@ -687,13 +714,14 @@ class App(tk.Tk):
         self.tree.configure(yscrollcommand=vs.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="left", fill="y")
+        self.tree.tag_configure("cip_warn", foreground="red")
         self.tree.bind("<Double-1>", lambda e: self._load_selected())
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<<TreeviewSelect>>", self._refresh_checks)
 
         tb = ttk.Frame(parent)
         tb.pack(fill="x", pady=(6, 0))
-        ttk.Button(tb, text="선택 행 불러오기", command=self._load_selected).pack(side="left")
+        ttk.Button(tb, text="전체 선택", command=self._select_all_lines).pack(side="left")
         ttk.Button(tb, text="선택 행에 반영", command=self._apply_to_selected).pack(
             side="left", padx=6)
         ttk.Button(tb, text="선택 행 복제", command=self._dup_line).pack(side="left")
@@ -780,6 +808,14 @@ class App(tk.Tk):
         if price is not None and not self.line_vars["W"].get().strip():
             self.line_vars["W"].set(str(price))
 
+    def _check_cip_warning(self):
+        """자재코드가 CIP 시트의 AS-IS FSC(J열)와 완전히 같으면 빨간 글씨로 표시."""
+        code = self.line_vars["Q"].get().strip()
+        is_cip = bool(self.md and code and code in self.md.cip_fsc)
+        entry = getattr(self, "entry_Q", None)
+        if entry is not None:
+            entry.configure(foreground="red" if is_cip else "black")
+
     def _on_date_input(self):
         if self._t_guard:
             return
@@ -852,6 +888,9 @@ class App(tk.Tk):
 
     def _selected_indices(self):
         return sorted(self.tree.index(iid) for iid in self.tree.selection())
+
+    def _select_all_lines(self):
+        self.tree.selection_set(self.tree.get_children())
 
     def _selected_index(self):
         idxs = self._selected_indices()
@@ -931,8 +970,11 @@ class App(tk.Tk):
 
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
+        cip = self.md.cip_fsc if self.md else set()
         for n, d in enumerate(self.lines, start=1):
-            self.tree.insert("", "end", values=["☐", n] + [d[k] for k in LINE_KEYS])
+            tags = ("cip_warn",) if d["Q"].strip() in cip else ()
+            self.tree.insert("", "end", values=["☐", n] + [d[k] for k in LINE_KEYS],
+                             tags=tags)
         self.line_count.config(text="%d 행" % len(self.lines))
 
     # ---------- 출력
@@ -957,9 +999,9 @@ class App(tk.Tk):
         return out, errs
 
     def _build_rows(self, common):
-        # 판매처코드/인도처코드/유통경로/제품군/출하지점은 업로드 시스템이
-        # 반드시 엑셀 숫자 형식으로 인식해야 하므로 정수로 변환해 저장한다.
-        # (숫자로 변환되지 않는 값은 원래 문자열을 그대로 둔다)
+        # 판매처코드/인도처코드/유통경로/제품군/출하지점/고객PO번호는 업로드
+        # 시스템이 반드시 엑셀 숫자 형식으로 인식해야 하므로 정수로 변환해
+        # 저장한다. (숫자로 변환되지 않는 값은 원래 문자열을 그대로 둔다)
         rows = []
         for d in self.lines:
             row = {}
@@ -973,7 +1015,7 @@ class App(tk.Tk):
                 row[k] = v if v != "" else None
             for k in LINE_KEYS:
                 v = d[k]
-                if k == "C":
+                if k in ("C", "F"):
                     iv = parse_int(v)
                     v = iv if iv is not None else (v or None)
                 elif k == "T":
@@ -1009,7 +1051,7 @@ class App(tk.Tk):
             return
         rows = self._build_rows(common)
         try:
-            build_output(self.master_path.get(), rows, out)
+            build_output(self.master_path.get(), rows, out, cip_fsc=self.md.cip_fsc)
             append_log(log_path(), rows, os.path.basename(out))
         except Exception as e:
             messagebox.showerror("오류", "파일 생성에 실패했습니다.\n\n%s" % e)
@@ -1027,13 +1069,16 @@ class App(tk.Tk):
         return os.path.join(app_dir(), SETTINGS_NAME)
 
     def _save_settings(self, silent=False):
+        # 고객PO일자/가격결정일(G, J)은 항상 '작성 당일'이어야 하므로
+        # 공통값 고정 여부와 상관없이 저장/복원 대상에서 제외한다.
         data = {"master": self.master_path.get(),
-                "common": {k: v.get() for k, v in self.common_vars.items()}}
+                "common": {k: v.get() for k, v in self.common_vars.items()
+                          if k not in ("G", "J")}}
         try:
             with open(self._settings_path(), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             if not silent:
-                self.status.config(text="공통값을 저장했습니다.")
+                self.status.config(text="공통값을 고정했습니다.")
         except Exception:
             pass
 
@@ -1044,6 +1089,8 @@ class App(tk.Tk):
         except Exception:
             return
         for k, v in data.get("common", {}).items():
+            if k in ("G", "J"):
+                continue
             if k in self.common_vars:
                 self.common_vars[k].set(v)
 
